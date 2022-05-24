@@ -29,9 +29,9 @@ import (
 	e2e "k8s.io/kubernetes/test/e2e/framework"
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
 
+	appsv1 "github.com/openshift/api/apps/v1"
 	configv1 "github.com/openshift/api/config/v1"
 	osinv1 "github.com/openshift/api/osin/v1"
-	clusteroperatorhelpers "github.com/openshift/library-go/pkg/config/clusteroperator/v1helpers"
 
 	exutil "github.com/openshift/origin/test/extended/util"
 )
@@ -505,25 +505,39 @@ func getTokenFromResponse(resp *http.Response) string {
 	return ""
 }
 
-func waitForAuthenticationProgressing(oc *exutil.CLI, expectedProgressing configv1.ConditionStatus) {
+func waitForAuthenticationProgressing(oc *exutil.CLI, expectedProgressing corev1.ConditionStatus) {
 	err := wait.PollImmediate(time.Second, 10*time.Minute, func() (bool, error) {
-		authn, err := oc.AdminConfigClient().ConfigV1().ClusterOperators().Get(context.Background(), "authentication", metav1.GetOptions{})
+		deploy, err := oc.AdminAppsClient().
+			AppsV1().
+			DeploymentConfigs("openshift-authentication ").
+			Get(context.Background(), "oauth-openshift", metav1.GetOptions{})
 		if err != nil {
 			e2e.Logf("Error getting authentication operator: %v", err)
 			return false, err
 		}
 
-		progressing := clusteroperatorhelpers.FindStatusCondition(authn.Status.Conditions, configv1.OperatorProgressing)
-		if progressing == nil || progressing.Status != expectedProgressing {
-			e2e.Logf("Waiting for progressing condition to be %q: %s", expectedProgressing, spew.Sdump(authn.Status.Conditions))
+		if !isExpectedConditionState(
+			deploy.Status.Conditions,
+			appsv1.DeploymentProgressing,
+			expectedProgressing,
+		) {
+			e2e.Logf("Waiting for progressing condition to be %q: %s", expectedProgressing, spew.Sdump(deploy.Status.Conditions))
 			return false, nil
 		}
 
-		if expectedProgressing == configv1.ConditionFalse {
-			// make additional checks on availability and degraded status
-			if clusteroperatorhelpers.IsStatusConditionFalse(authn.Status.Conditions, configv1.OperatorAvailable) ||
-				clusteroperatorhelpers.IsStatusConditionTrue(authn.Status.Conditions, configv1.OperatorDegraded) {
-				e2e.Logf("Waiting for available==True, progressing==False, degraded==False: %s", spew.Sdump(authn.Status.Conditions))
+		if expectedProgressing == corev1.ConditionFalse {
+			isOperatorAvailable := isExpectedConditionState(
+				deploy.Status.Conditions,
+				appsv1.DeploymentAvailable,
+				corev1.ConditionTrue,
+			)
+			isReplicaFailure := isExpectedConditionState(
+				deploy.Status.Conditions,
+				appsv1.DeploymentReplicaFailure,
+				corev1.ConditionTrue,
+			)
+			if !isOperatorAvailable || isReplicaFailure {
+				e2e.Logf("Waiting for available==True, progressing==False, replica failure==False: %s", spew.Sdump(deploy.Status.Conditions))
 				return false, nil
 			}
 
@@ -532,4 +546,33 @@ func waitForAuthenticationProgressing(oc *exutil.CLI, expectedProgressing config
 		return true, nil
 	})
 	o.Expect(err).NotTo(o.HaveOccurred())
+}
+
+func isExpectedConditionState(
+	conditions []appsv1.DeploymentCondition,
+	conditionType appsv1.DeploymentConditionType,
+	expectedState corev1.ConditionStatus,
+) bool {
+	condition := findProgressingDeploymentCondition(
+		conditions, conditionType,
+	)
+	if condition == nil {
+		// no state is not an expected state
+		return false
+	}
+
+	return condition.Status == expectedState
+}
+
+func findProgressingDeploymentCondition(
+	conditions []appsv1.DeploymentCondition,
+	conditionType appsv1.DeploymentConditionType,
+) *appsv1.DeploymentCondition {
+	for i := range conditions {
+		if conditions[i].Type == conditionType {
+			return &conditions[i]
+		}
+	}
+
+	return nil
 }
